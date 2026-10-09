@@ -252,16 +252,31 @@ async def analyze_issue(
       .strip()
     )
     if req.issue_url:
-
       try:
-
-        fetched = await fetch_github_issue(
-          req.issue_url
-        )
+        from utils import parse_github_issue_url
+        from github_issues import get_cached_issue
+        
+        parsed_issue = parse_github_issue_url(req.issue_url)
+        fetched = None
+        if parsed_issue:
+          owner, repo_name, number = parsed_issue
+          r_url = f"https://github.com/{owner}/{repo_name}"
+          cached_issue = get_cached_issue(r_url, int(number))
+          if cached_issue:
+            fetched = {
+              "title": cached_issue.get("title", ""),
+              "body": cached_issue.get("body", "") or "",
+              "labels": [l["name"] for l in cached_issue.get("labels", []) if isinstance(l, dict)],
+              "number": cached_issue.get("number")
+            }
+            
+        if not fetched:
+          fetched = await fetch_github_issue(req.issue_url)
 
         issue_title = (
             fetched.get("title") or ""
         ).strip()
+
 
         issue_text = (
             fetched.get("body") or ""
@@ -576,3 +591,186 @@ async def analyze_repo(req: RepoLoadRequest):
         "action_plan": [{"priority": 1, "title": f"Address {len(findings)} findings", "effort": "medium"}],
         "timings": {}
     }
+
+from schemas import RepoIssuesRequest
+from github_issues import fetch_open_issues, fast_score_issue, detect_linked_pr_and_claimed, localize_issue, run_deep_pass
+
+@router.post("/repo-issues")
+@limiter.limit("5/minute")
+async def get_repo_issues(request: Request, payload: RepoIssuesRequest):
+    import time
+    from utils import get_repo_name
+    from services import repo_cache
+    
+    t0 = time.time()
+    
+    cache_key = normalize_repo_url(payload.repo_url)
+    if cache_key not in repo_cache:
+        raise HTTPException(status_code=409, detail="Repository not loaded. Please call /api/load-repo first.")
+        
+    engine_bundle = repo_cache[cache_key].get("engine_bundle", {})
+    sources = engine_bundle.get("sources", {})
+    
+    # 1. Fetch
+    try:
+        fetch_res = await fetch_open_issues(payload.repo_url, max_issues=payload.limit, state=payload.state)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    if "message" in fetch_res and not fetch_res.get("issues"):
+        return {"repo_name": get_repo_name(payload.repo_url), "repo_url": payload.repo_url, "total_open": 0, "returned": 0, "truncated": False, "rate_limit": fetch_res.get("rate_limit"), "counts": {}, "issues": [], "timings": {}}
+        
+    raw_issues = fetch_res.get("issues", [])
+    
+    # 2. Fast score & localize
+    scored_issues = []
+    counts = {"easy": 0, "medium": 0, "hard": 0, "claimed": 0}
+    
+    for issue in raw_issues:
+        has_assignee = bool(issue.get("assignees") or issue.get("assignee"))
+        
+        # Localize
+        likely_files = localize_issue(issue, sources)
+        
+        # Fast score
+        score, signals = fast_score_issue(issue, likely_files)
+        
+        level = "hard"
+        if score >= 70:
+            level = "easy"
+        elif score >= 40:
+            level = "medium"
+            
+        is_claimed = False
+        claim_reason = None
+        if has_assignee:
+            is_claimed = True
+            claim_reason = "Has assignee"
+            
+        gfi = "good first issue" in [l.get("name", "").lower() for l in issue.get("labels", []) if isinstance(l, dict)]
+        
+        diff = {
+            "level": level,
+            "ease_score": score,
+            "reasons": [],
+            "reasons_source": "heuristic",
+            "estimated_hours": None,
+            "good_first_issue": gfi,
+            "confidence": "medium"
+        }
+        
+        scored_issues.append({
+            "number": issue.get("number"),
+            "title": issue.get("title"),
+            "url": issue.get("html_url"),
+            "labels": [l.get("name") for l in issue.get("labels", []) if isinstance(l, dict)],
+            "author": issue.get("user", {}).get("login"),
+            "comments": issue.get("comments", 0),
+            "created_at": issue.get("created_at"),
+            "updated_at": issue.get("updated_at"),
+            "likely_claimed": is_claimed,
+            "claimed_reason": claim_reason,
+            "difficulty": diff,
+            "signals": signals,
+            "likely_files": likely_files,
+            "summary": None,
+            "_raw_body": issue.get("body", "") # hidden field for deep pass
+        })
+        
+    # Sort
+    scored_issues.sort(key=lambda x: (x["likely_claimed"], -x["difficulty"]["ease_score"]))
+    
+    # Check top 30 for linked PR if not already claimed
+    import asyncio
+    owner, repo_name = get_repo_name(payload.repo_url), get_repo_name(payload.repo_url) # weak fallback
+    from github_issues import parse_owner_repo
+    parsed = parse_owner_repo(payload.repo_url)
+    if parsed:
+        owner, repo_name = parsed
+        
+    tasks = []
+    for issue in scored_issues[:30]:
+        if not issue["likely_claimed"]:
+            tasks.append(detect_linked_pr_and_claimed(owner, repo_name, issue["number"], False))
+        else:
+            tasks.append(asyncio.sleep(0, result=(issue["likely_claimed"], issue["claimed_reason"])))
+            
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for idx, res in enumerate(results):
+            if isinstance(res, tuple):
+                claimed, reason = res
+                if claimed:
+                    scored_issues[idx]["likely_claimed"] = True
+                    scored_issues[idx]["claimed_reason"] = reason
+                    
+    # Re-sort after PR check
+    scored_issues.sort(key=lambda x: (x["likely_claimed"], -x["difficulty"]["ease_score"]))
+    
+    for i in scored_issues:
+        if i["likely_claimed"]:
+            counts["claimed"] += 1
+        else:
+            counts[i["difficulty"]["level"]] += 1
+            
+    t_fast = time.time()
+    
+    if payload.stream:
+        async def event_stream():
+            yield json.dumps({"type": "issues_fetched", "total": len(raw_issues)}) + "\n"
+            
+            # Send fast scored issues immediately
+            # Remove hidden field
+            clean_issues = []
+            for item in scored_issues:
+                c = dict(item)
+                c.pop("_raw_body", None)
+                clean_issues.append(c)
+                
+            yield json.dumps({"type": "issues_scored", "issues": clean_issues}) + "\n"
+            
+            # Deep pass
+            deep_tasks = []
+            for issue in scored_issues[:payload.deep_top_n]:
+                raw_dict = {"title": issue["title"], "body": issue.get("_raw_body", ""), "likely_files": issue["likely_files"], "signals": issue["signals"]}
+                deep_tasks.append((issue["number"], run_deep_pass(raw_dict, sources)))
+                
+            for num, task in deep_tasks:
+                res = await task
+                yield json.dumps({"type": "issue_enriched", "number": num, "summary": res.get("summary"), "reasons": res.get("reasons")}) + "\n"
+                
+            yield json.dumps({"type": "done"}) + "\n"
+            
+        return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+        
+    else:
+        # Sync deep pass
+        deep_tasks = []
+        for issue in scored_issues[:payload.deep_top_n]:
+            raw_dict = {"title": issue["title"], "body": issue.get("_raw_body", ""), "likely_files": issue["likely_files"], "signals": issue["signals"]}
+            deep_tasks.append((issue, run_deep_pass(raw_dict, sources)))
+            
+        for issue, task in deep_tasks:
+            res = await task
+            issue["summary"] = res.get("summary")
+            issue["difficulty"]["reasons"] = res.get("reasons", [])
+            issue["difficulty"]["reasons_source"] = res.get("reasons_source", "llm")
+            
+        for item in scored_issues:
+            item.pop("_raw_body", None)
+            
+        return {
+            "repo_name": get_repo_name(payload.repo_url),
+            "repo_url": payload.repo_url,
+            "total_open": len(raw_issues),
+            "returned": len(scored_issues),
+            "truncated": fetch_res.get("truncated", False),
+            "rate_limit": fetch_res.get("rate_limit", {}),
+            "counts": counts,
+            "issues": scored_issues,
+            "timings": {
+                "fast_pass": t_fast - t0,
+                "deep_pass": time.time() - t_fast,
+                "total": time.time() - t0
+            }
+        }

@@ -126,3 +126,10 @@ class Timings(BaseModel):
     prompt_build: float = 0.0
     time_to_first_token: float = 0.0
     total_generation: float = 0.0
+
+class RepoIssuesRequest(BaseModel):
+    repo_url: str
+    limit: int = 50
+    state: str = "open"
+    deep_top_n: int = 5
+    stream: bool = False
