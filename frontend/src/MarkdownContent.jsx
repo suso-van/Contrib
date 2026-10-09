@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import hljs from 'highlight.js';
 import { Copy, Check, Terminal } from 'lucide-react';
+import { normalizeEscapedMarkdown } from './markdownUtils';
 
 function CodeBlock({ language, code }) {
   const [copied, setCopied] = useState(false);
@@ -140,6 +141,8 @@ function CodeBlock({ language, code }) {
 }
 
 export default function MarkdownContent({ content }) {
+  const normalized = useMemo(() => normalizeEscapedMarkdown(content), [content]);
+
   if (!content) return null;
 
   return (
@@ -424,7 +427,7 @@ export default function MarkdownContent({ content }) {
           },
         }}
       >
-        {content}
+        {normalized}
       </ReactMarkdown>
     </div>
   );
