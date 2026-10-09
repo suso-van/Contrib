@@ -215,12 +215,31 @@ function TreeNode({ node, depth = 0, collapsedDirs, toggleDir, highlightPaths = 
   );
 }
 
+function normaliseNode(node) {
+  return {
+    name: node.name,
+    path: node.path,
+    isDirectory: node.isDirectory !== undefined ? node.isDirectory : node.type === 'dir',
+    children: Array.isArray(node.children) ? node.children.map(normaliseNode) : [],
+  };
+}
+
 export default function ProjectFileTree({ files, repoName, isPartial = false, highlightPaths = [] }) {
-  const isAlreadyTree = files && files.length > 0 && typeof files[0] === 'object' && 'isDirectory' in files[0];
-  
+  // Backend tree nodes use {name, path, type: "file"|"dir", children[]} — detect both backend and internal formats
+  const isAlreadyTree =
+    files &&
+    files.length > 0 &&
+    typeof files[0] === 'object' &&
+    ('isDirectory' in files[0] || 'type' in files[0]);
+
   const tree = useMemo(() => {
     if (isAlreadyTree) {
-      return { name: repoName, path: '', isDirectory: true, children: files };
+      return {
+        name: repoName,
+        path: '',
+        isDirectory: true,
+        children: files.map(normaliseNode),
+      };
     }
     return buildFileTree(files, repoName);
   }, [files, repoName, isAlreadyTree]);
@@ -296,7 +315,18 @@ export default function ProjectFileTree({ files, repoName, isPartial = false, hi
     setCollapsedDirs(allPaths);
   };
 
-  const fileCount = Array.isArray(files) ? files.length : 0;
+  // Count leaf files recursively (works for both backend and normalised tree nodes)
+  const countLeafFiles = (node) => {
+    if (!node) return 0;
+    if (!node.isDirectory) return 1;
+    if (!Array.isArray(node.children) || node.children.length === 0) return 0;
+    return node.children.reduce((sum, child) => sum + countLeafFiles(child), 0);
+  };
+  const fileCount = isAlreadyTree
+    ? countLeafFiles(tree)
+    : Array.isArray(files)
+      ? files.length
+      : 0;
 
   return (
     <div
@@ -324,7 +354,7 @@ export default function ProjectFileTree({ files, repoName, isPartial = false, hi
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <FolderTree size={12} color="#00ff41" />
           <span style={{ color: '#00aa28', letterSpacing: 1, fontWeight: 600 }}>
-            REFERENCED FILE TREE
+            {isPartial ? "PARTIAL PROJECT STRUCTURE (REFERENCED FILES ONLY)" : "PROJECT STRUCTURE"}
           </span>
           <span
             style={{
