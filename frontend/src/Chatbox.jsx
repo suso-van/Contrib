@@ -339,8 +339,28 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
   const resolvedRepoName = data?.repo_name || repoName || "Repository";
   const resolvedRepoUrl = repoUrl || data?.repo_url || "";
   const relevantFiles = data?.relevant_files || [];
+  const projectStructure = data?.project_structure || [];
+  const sections = data?.sections || [];
+  const citations = data?.citations || [];
+  const isTruncated = data?.truncated || false;
+  
   const hasFiles = Array.isArray(relevantFiles) && relevantFiles.length > 0;
-  const fileCount = hasFiles ? relevantFiles.length : 0;
+  
+  // Use project_structure if available and not empty, otherwise fallback to reconstructing from relevant_files
+  const treeFiles = projectStructure.length > 0 ? projectStructure : relevantFiles;
+  const isPartialTree = projectStructure.length === 0;
+  
+  // To show the real file count, count files in projectStructure if available
+  const countFiles = (items) => {
+    let count = 0;
+    for (const item of items) {
+      if (typeof item === 'string') count++;
+      else if (item.isDirectory === false) count++;
+      else if (item.children) count += countFiles(item.children);
+    }
+    return count;
+  };
+  const fileCount = isPartialTree ? relevantFiles.length : countFiles(projectStructure);
 
   return (
     <div
@@ -409,10 +429,29 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
       {/* 1. Main Answer with formatted Markdown */}
       <div style={{ padding: "18px 22px" }}>
         <MarkdownContent content={data?.answer || "No response content available."} />
+        {isTruncated && (
+          <div style={{ color: "#ffcc00", fontSize: 11, marginTop: 10 }}>
+            [WARNING] The repository context was truncated due to size limits.
+          </div>
+        )}
       </div>
+      
+      {/* 1.5 Sections */}
+      {sections.length > 0 && (
+        <div style={{ padding: "0 22px 18px", display: "flex", flexDirection: "column", gap: 16 }}>
+          {sections.map((sec, idx) => (
+             sec.content && sec.content.trim() !== (data?.answer || "").trim() ? (
+              <div key={idx} style={{ padding: "12px", background: "rgba(0,255,65,0.05)", borderLeft: "2px solid #00ff41" }}>
+                <h4 style={{ color: "#00ff41", marginBottom: 8, fontSize: 13 }}>{sec.title}</h4>
+                <MarkdownContent content={sec.content} />
+              </div>
+            ) : null
+          ))}
+        </div>
+      )}
 
       {/* 2. Project Structure & 3. Sources & References */}
-      {hasFiles && (
+      {(hasFiles || projectStructure.length > 0) && (
         <div
           style={{
             borderTop: "1px solid rgba(0,255,65,0.12)",
@@ -430,17 +469,33 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
             defaultOpen={true}
             accent={true}
           >
-            <ProjectFileTree files={relevantFiles} repoName={resolvedRepoName} />
+            <ProjectFileTree 
+               files={treeFiles} 
+               repoName={resolvedRepoName} 
+               isPartial={isPartialTree}
+               highlightPaths={relevantFiles}
+            />
           </Accordion>
 
           {/* Section 3: Sources & References */}
           <Accordion
-            title={`SOURCES & REFERENCES (${fileCount})`}
+            title={`SOURCES & REFERENCES (${citations.length > 0 ? citations.length : fileCount})`}
             icon={FileCode}
             defaultOpen={true}
             accent={false}
           >
-            <SourcesList files={relevantFiles} repoUrl={resolvedRepoUrl} />
+            {citations.length > 0 ? (
+               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                 {citations.map((cit, idx) => (
+                   <div key={idx} style={{ background: "rgba(0,20,5,0.4)", border: "1px solid rgba(0,255,65,0.1)", padding: 8, borderRadius: 4 }}>
+                     <div style={{ fontSize: 11, color: "#00ff41", marginBottom: 4 }}>{cit.file} (Lines {cit.start_line}-{cit.end_line})</div>
+                     <pre style={{ fontSize: 10, color: "#00cc2e", margin: 0, whiteSpace: "pre-wrap" }}>{cit.snippet}</pre>
+                   </div>
+                 ))}
+               </div>
+            ) : (
+               <SourcesList files={relevantFiles} repoUrl={resolvedRepoUrl} />
+            )}
           </Accordion>
         </div>
       )}

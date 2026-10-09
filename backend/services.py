@@ -165,7 +165,8 @@ _IGNORE_EXTS: frozenset[str] = frozenset({
     ".css", ".scss", ".less",
     ".html", ".htm",
     ".xml",
-    ".sh", ".bat", ".ps1",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".download",
 })
 
 _IGNORE_NAME_PATTERNS: Tuple[str, ...] = (
@@ -177,6 +178,7 @@ _IGNORE_NAME_PATTERNS: Tuple[str, ...] = (
     "LICENSE", "LICENCE", "NOTICE", "AUTHORS", "CONTRIBUTORS",
     "package.json", "package-lock.json", "yarn.lock",
     "tsconfig.json", "eslint", "prettier", ".editorconfig",
+    "jquery", "vendor", "bootstrap", "tailwind",
 )
 
 _CORE_DIR_HINTS: frozenset[str] = frozenset({
@@ -1721,7 +1723,7 @@ def run_repo_qa(engine_bundle: dict, question: str) -> dict:
     prompt = f"""You are an expert AI mentor helping a developer understand a codebase.
 Answer the question using ONLY the source code chunks provided below. 
 Do not invent code, outputs, or attribute names. Quote identifiers exactly as they appear.
-If the answer cannot be found in the context, say "not found in the retrieved files".
+If the answer cannot be found in the context, say "not found in the retrieved files" and avoid generic tutorials.
 Include the exact file path for every claim. Keep your answer concise (under ~250 words unless more is needed).
 
 Files you may reference:
@@ -1790,9 +1792,16 @@ Format your answer as a JSON object with:
     valid_sections = []
     for s in sections:
         refs = [r for r in s.get("references", []) if r in sources]
+        
+        content = s.get("content", "")
+        # Strip "**Sources**" or similar block from content if the LLM hallucinated it
+        sources_idx = content.find("**Sources**")
+        if sources_idx != -1:
+            content = content[:sources_idx].strip()
+            
         valid_sections.append({
             "title": s.get("title", "Section"),
-            "content": s.get("content", ""),
+            "content": content,
             "references": list(set(refs))
         })
         

@@ -108,9 +108,12 @@ function buildFileTree(files, rootName = 'repository') {
   return toArray(root);
 }
 
-function TreeNode({ node, depth = 0, collapsedDirs, toggleDir }) {
+function TreeNode({ node, depth = 0, collapsedDirs, toggleDir, highlightPaths = [] }) {
   const isCollapsed = Boolean(collapsedDirs[node.path]);
   const isDir = node.isDirectory;
+  
+  const isHighlighted = highlightPaths.includes(node.path);
+  const highlightStyle = isHighlighted ? { background: 'rgba(255, 204, 0, 0.2)', color: '#ffcc00' } : {};
 
   return (
     <div style={{ marginLeft: depth > 0 ? 14 : 0 }}>
@@ -175,6 +178,7 @@ function TreeNode({ node, depth = 0, collapsedDirs, toggleDir }) {
                   depth={depth + 1}
                   collapsedDirs={collapsedDirs}
                   toggleDir={toggleDir}
+                  highlightPaths={highlightPaths}
                 />
               ))}
             </div>
@@ -191,6 +195,7 @@ function TreeNode({ node, depth = 0, collapsedDirs, toggleDir }) {
             fontSize: 12,
             fontFamily: "'JetBrains Mono', monospace",
             color: '#00bb2f',
+            ...highlightStyle
           }}
           onMouseEnter={e => {
             e.currentTarget.style.background = 'rgba(0, 255, 65, 0.05)';
@@ -210,11 +215,46 @@ function TreeNode({ node, depth = 0, collapsedDirs, toggleDir }) {
   );
 }
 
-export default function ProjectFileTree({ files, repoName }) {
-  const tree = useMemo(() => buildFileTree(files, repoName), [files, repoName]);
+export default function ProjectFileTree({ files, repoName, isPartial = false, highlightPaths = [] }) {
+  const isAlreadyTree = files && files.length > 0 && typeof files[0] === 'object' && 'isDirectory' in files[0];
+  
+  const tree = useMemo(() => {
+    if (isAlreadyTree) {
+      return { name: repoName, path: '', isDirectory: true, children: files };
+    }
+    return buildFileTree(files, repoName);
+  }, [files, repoName, isAlreadyTree]);
 
-  // Map of collapsed paths (empty means all expanded)
-  const [collapsedDirs, setCollapsedDirs] = useState({});
+  // Expand folders along the highlighted paths by default
+  const defaultCollapsedDirs = useMemo(() => {
+    const allPaths = {};
+    const expandPaths = new Set();
+    
+    // Add highlighted paths and their parents to expand list
+    highlightPaths.forEach(p => {
+      const parts = p.split('/');
+      let current = '';
+      for (let i = 0; i < parts.length - 1; i++) {
+        current += (i === 0 ? '' : '/') + parts[i];
+        expandPaths.add(current);
+      }
+    });
+
+    function collect(node) {
+      if (node.isDirectory && node.path) {
+        if (!expandPaths.has(node.path)) {
+          allPaths[node.path] = true;
+        }
+      }
+      if (node.children) {
+        node.children.forEach(collect);
+      }
+    }
+    collect(tree || {});
+    return allPaths;
+  }, [tree, highlightPaths]);
+
+  const [collapsedDirs, setCollapsedDirs] = useState(defaultCollapsedDirs);
 
   if (!tree || !tree.children || tree.children.length === 0) {
     return (
@@ -370,26 +410,29 @@ export default function ProjectFileTree({ files, repoName }) {
           depth={0}
           collapsedDirs={collapsedDirs}
           toggleDir={toggleDir}
+          highlightPaths={highlightPaths}
         />
       </div>
 
       {/* Partial inference disclaimer */}
-      <div
-        style={{
-          marginTop: 10,
-          paddingTop: 8,
-          borderTop: '1px solid rgba(0, 255, 65, 0.06)',
-          fontSize: 10,
-          color: '#005515',
-          fontFamily: "'JetBrains Mono', monospace",
-          letterSpacing: 0.5,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-        }}
-      >
-        <span>// Note: Partial structure reconstructed from referenced files; not the complete repository.</span>
-      </div>
+      {isPartial && (
+        <div
+          style={{
+            marginTop: 10,
+            paddingTop: 8,
+            borderTop: '1px solid rgba(0, 255, 65, 0.06)',
+            fontSize: 10,
+            color: '#005515',
+            fontFamily: "'JetBrains Mono', monospace",
+            letterSpacing: 0.5,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+          }}
+        >
+          <span>// Note: Partial structure reconstructed from referenced files; not the complete repository.</span>
+        </div>
+      )}
     </div>
   );
 }
