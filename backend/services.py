@@ -837,28 +837,22 @@ Issue:
 Return a JSON object with exactly these keys:
 {{
   "issue_type": "bug|feature|docs|refactor|test",
-  "difficulty": {{
-    "level": "easy|medium|hard",
-    "label": "Short label",
-    "score": 5,
-    "estimated_hours": {{"min": 1, "max": 2}},
-    "reasons": ["reason 1"],
-    "confidence": "high|medium|low",
-    "good_first_issue": true
-  }},
+  "difficulty": "easy|medium|hard",
+  "estimated_hours": 2,
+  "good_first_issue": true,
   "problem_summary": "One sentence summary of the issue.",
-  "root_cause": {{
-    "hypothesis": "what is most likely causing this",
-    "status": "potential"
-  }},
+  "root_cause_hypothesis": "what is most likely causing this",
+  "difficulty_reason": "why this difficulty",
   "required_skills": ["skill1", "skill2"],
-  "affected_areas": [
-    {{"path": "path/to/file", "role": "Main logic", "why": "reason"}}
-  ]
+  "affected_areas": ["path/to/file1", "path/to/file2"]
 }}"""
     try:
-        resp = Settings.llm.complete(prompt)
-        return extract_json(str(resp))
+        if "ollama" in Settings.llm.__class__.__name__.lower():
+            resp = str(Settings.llm.complete(prompt, format="json"))
+        else:
+            response_format = {"type": "json_object"}
+            resp = str(Settings.llm.complete(prompt, response_format=response_format))
+        return extract_json(resp)
     except Exception as exc:
         logger.warning(f"Issue analysis failed: {exc}")
         return {}
