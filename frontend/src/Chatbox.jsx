@@ -1,14 +1,16 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { motion } from "framer-motion";
 import {
   Send, ChevronDown, ChevronRight, FileCode, Brain,
   Search, AlertTriangle, 
   Zap, BookOpen, GitCommit, Wrench, MessageSquare, GitBranch,
-  FolderTree
+  FolderTree, ListOrdered
 } from "lucide-react";
 import MarkdownContent from "./MarkdownContent";
 import ProjectFileTree from "./ProjectFileTree";
 import SourcesList from "./SourcesList";
+import RankedIssuesView from "./RankedIssuesView";
+import { ensureRepoLoaded, fetchRankedIssues } from "./apiService";
 
 
 function Badge({ label, color = "green" }) {
@@ -335,32 +337,80 @@ function IssueAnalysisCard({ data }) {
 
       
 
+function sanitizeRepoName(name, fallbackUrl) {
+  if (
+    !name ||
+    typeof name !== "string" ||
+    name.includes("tmp") ||
+    name.includes("cloned_repo") ||
+    name.includes("var/folders") ||
+    name.includes("AppData") ||
+    name.includes("/") ||
+    name.includes("\\")
+  ) {
+    if (fallbackUrl && typeof fallbackUrl === "string") {
+      const clean = fallbackUrl.replace(/\/+$/, "").replace(/\.git$/, "");
+      const parts = clean.split("/");
+      const last = parts[parts.length - 1];
+      if (last && !last.includes("tmp")) return last;
+    }
+    return "Repository";
+  }
+  return name;
+}
+
 function QAAnswerCard({ data, repoUrl, repoName }) {
-  const resolvedRepoName = data?.repo_name || repoName || "Repository";
   const resolvedRepoUrl = repoUrl || data?.repo_url || "";
-  const relevantFiles = data?.relevant_files || [];
-  const projectStructure = data?.project_structure || [];
-  const sections = data?.sections || [];
-  const citations = data?.citations || [];
-  const isTruncated = data?.truncated || false;
+  const resolvedRepoName = sanitizeRepoName(data?.repo_name || repoName, resolvedRepoUrl);
+  const relevantFiles = Array.isArray(data?.relevant_files) ? data.relevant_files : [];
+  const projectStructure = Array.isArray(data?.project_structure) ? data.project_structure : [];
+  const sections = Array.isArray(data?.sections) ? data.sections : [];
+  const citations = Array.isArray(data?.citations) ? data.citations : [];
+  const isTruncated = Boolean(data?.truncated);
+  const retrievalMode = data?.retrieval_mode || null;
   
-  const hasFiles = Array.isArray(relevantFiles) && relevantFiles.length > 0;
+  const hasFiles = relevantFiles.length > 0;
+  const hasTree = projectStructure.length > 0;
   
-  // Use project_structure if available and not empty, otherwise fallback to reconstructing from relevant_files
-  const treeFiles = projectStructure.length > 0 ? projectStructure : relevantFiles;
-  const isPartialTree = projectStructure.length === 0;
+  // Use project_structure if available, otherwise fallback to reconstructing from relevant_files
+  const treeFiles = hasTree ? projectStructure : relevantFiles;
+  const isPartialTree = !hasTree || isTruncated;
   
-  // To show the real file count, count files in projectStructure if available
+  // Count actual leaf file nodes by traversing the tree, counting each distinct path once
   const countFiles = (items) => {
     let count = 0;
-    for (const item of items) {
-      if (typeof item === 'string') count++;
-      else if (item.isDirectory === false) count++;
-      else if (item.children) count += countFiles(item.children);
-    }
+    const seen = new Set();
+    const traverse = (nodes) => {
+      if (!Array.isArray(nodes)) return;
+      for (const item of nodes) {
+        if (typeof item === 'string') {
+          if (!seen.has(item)) {
+            seen.add(item);
+            count++;
+          }
+        } else if (item && typeof item === 'object') {
+          const isFile = item.type === 'file' || item.isDirectory === false;
+          if (isFile) {
+            const p = item.path || item.name;
+            if (p && !seen.has(p)) {
+              seen.add(p);
+              count++;
+            } else if (!p) {
+              count++;
+            }
+          } else if (Array.isArray(item.children)) {
+            traverse(item.children);
+          }
+        }
+      }
+    };
+    traverse(items);
     return count;
   };
-  const fileCount = isPartialTree ? relevantFiles.length : countFiles(projectStructure);
+  const fileCount = countFiles(treeFiles);
+
+  const hasAnswer = Boolean(data?.answer && data.answer.trim().length > 0);
+  const citationsCount = citations.length;
 
   return (
     <div
@@ -397,7 +447,7 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
               fontFamily: "'JetBrains Mono', monospace",
             }}
           >
-            DOCUMENTATION & ANALYSIS
+            REPOSITORY ANALYSIS
           </span>
         </div>
 
@@ -405,11 +455,14 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
           style={{
             display: "flex",
             alignItems: "center",
-            gap: 6,
+            gap: 8,
             fontSize: 10,
             fontFamily: "'JetBrains Mono', monospace",
           }}
         >
+          {retrievalMode && (
+            <Badge label={`RETRIEVAL: ${retrievalMode}`} color="muted" />
+          )}
           <span style={{ color: "#006618", letterSpacing: 1 }}>TARGET:</span>
           <span
             style={{
@@ -428,30 +481,90 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
 
       {/* 1. Main Answer with formatted Markdown */}
       <div style={{ padding: "18px 22px" }}>
-        <MarkdownContent content={data?.answer || "No response content available."} />
+        {hasAnswer ? (
+          <MarkdownContent content={data.answer} />
+        ) : sections.length > 0 ? (
+          /* Fallback when answer is missing: render sections cleanly */
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {sections.map((sec, idx) => (
+              <div key={idx} style={{ padding: "12px 14px", background: "rgba(0,255,65,0.04)", borderLeft: "2px solid #00ff41", borderRadius: "0 3px 3px 0" }}>
+                <h4 style={{ color: "#00ff41", marginBottom: 8, fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }}>{sec.title}</h4>
+                <MarkdownContent content={sec.content} />
+                {sec.references && sec.references.length > 0 && (
+                  <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {sec.references.map((ref, rIdx) => (
+                      <span key={rIdx} style={{
+                        background: "rgba(0,100,30,0.12)", border: "1px solid rgba(0,100,30,0.2)",
+                        color: "#00dd33", borderRadius: 2, padding: "1px 6px", fontSize: 10,
+                        fontFamily: "'JetBrains Mono', monospace",
+                      }}>
+                        {ref}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p style={{ color: "#00aa28", fontSize: 12, margin: 0 }}>No analysis content available.</p>
+        )}
+
         {isTruncated && (
-          <div style={{ color: "#ffcc00", fontSize: 11, marginTop: 10 }}>
-            [WARNING] The repository context was truncated due to size limits.
+          <div style={{ color: "#ffcc00", fontSize: 11, marginTop: 12, display: "flex", gap: 6, alignItems: "center" }}>
+            <span>⚠</span>
+            <span>[NOTICE] Context was truncated by the server due to repository size limits.</span>
           </div>
         )}
       </div>
-      
-      {/* 1.5 Sections */}
-      {sections.length > 0 && (
-        <div style={{ padding: "0 22px 18px", display: "flex", flexDirection: "column", gap: 16 }}>
-          {sections.map((sec, idx) => (
-             sec.content && sec.content.trim() !== (data?.answer || "").trim() ? (
-              <div key={idx} style={{ padding: "12px", background: "rgba(0,255,65,0.05)", borderLeft: "2px solid #00ff41" }}>
-                <h4 style={{ color: "#00ff41", marginBottom: 8, fontSize: 13 }}>{sec.title}</h4>
-                <MarkdownContent content={sec.content} />
-              </div>
-            ) : null
-          ))}
+
+      {/* 1.5 Categorized Finding References (associated relationships without duplicating answer text) */}
+      {hasAnswer && sections.some(s => Array.isArray(s.references) && s.references.length > 0) && (
+        <div style={{ padding: "0 22px 16px" }}>
+          <div style={{
+            background: "rgba(0,20,5,0.35)",
+            border: "1px solid rgba(0,255,65,0.12)",
+            borderRadius: 3,
+            padding: "10px 14px",
+          }}>
+            <div style={{ fontSize: 10, color: "#006618", letterSpacing: 1.5, marginBottom: 8, fontWeight: 700 }}>
+              REFERENCED FILES BY CATEGORY
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {sections.map((sec, idx) => (
+                sec.references && sec.references.length > 0 ? (
+                  <div key={idx} style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11, color: "#00cc2e", fontWeight: 600, minWidth: 140 }}>
+                      {sec.title}:
+                    </span>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {sec.references.map((ref, rIdx) => (
+                        <span
+                          key={rIdx}
+                          style={{
+                            background: "rgba(0,100,30,0.12)",
+                            border: "1px solid rgba(0,100,30,0.25)",
+                            color: "#00ff41",
+                            borderRadius: 2,
+                            padding: "1px 6px",
+                            fontSize: 10,
+                            fontFamily: "'JetBrains Mono', monospace",
+                          }}
+                        >
+                          {ref}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null
+              ))}
+            </div>
+          </div>
         </div>
       )}
 
       {/* 2. Project Structure & 3. Sources & References */}
-      {(hasFiles || projectStructure.length > 0) && (
+      {(hasFiles || hasTree) && (
         <div
           style={{
             borderTop: "1px solid rgba(0,255,65,0.12)",
@@ -463,42 +576,316 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
           }}
         >
           {/* Section 2: Expandable Project File Tree */}
-          <Accordion
-            title={`PROJECT STRUCTURE (${fileCount} ${fileCount === 1 ? "FILE" : "FILES"})`}
-            icon={FolderTree}
-            defaultOpen={true}
-            accent={true}
-          >
-            <ProjectFileTree 
-               files={treeFiles} 
-               repoName={resolvedRepoName} 
-               isPartial={isPartialTree}
-               highlightPaths={relevantFiles}
-            />
-          </Accordion>
+          {fileCount > 0 && (
+            <Accordion
+              title={`${isPartialTree ? "PARTIAL PROJECT STRUCTURE" : "PROJECT STRUCTURE"} (${fileCount} ${fileCount === 1 ? "FILE" : "FILES"})`}
+              icon={FolderTree}
+              defaultOpen={true}
+              accent={true}
+            >
+              <ProjectFileTree 
+                 files={treeFiles} 
+                 repoName={resolvedRepoName} 
+                 isPartial={isPartialTree}
+                 highlightPaths={relevantFiles}
+              />
+            </Accordion>
+          )}
 
           {/* Section 3: Sources & References */}
-          <Accordion
-            title={`SOURCES & REFERENCES (${citations.length > 0 ? citations.length : fileCount})`}
-            icon={FileCode}
-            defaultOpen={true}
-            accent={false}
-          >
-            {citations.length > 0 ? (
-               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                 {citations.map((cit, idx) => (
-                   <div key={idx} style={{ background: "rgba(0,20,5,0.4)", border: "1px solid rgba(0,255,65,0.1)", padding: 8, borderRadius: 4 }}>
-                     <div style={{ fontSize: 11, color: "#00ff41", marginBottom: 4 }}>{cit.file} (Lines {cit.start_line}-{cit.end_line})</div>
-                     <pre style={{ fontSize: 10, color: "#00cc2e", margin: 0, whiteSpace: "pre-wrap" }}>{cit.snippet}</pre>
-                   </div>
-                 ))}
-               </div>
-            ) : (
-               <SourcesList files={relevantFiles} repoUrl={resolvedRepoUrl} />
-            )}
-          </Accordion>
+          {(citationsCount > 0 || hasFiles) && (
+            <Accordion
+              title={citationsCount > 0
+                ? `SOURCES & REFERENCES (${citationsCount} ${citationsCount === 1 ? "CITATION" : "CITATIONS"})`
+                : `RELEVANT FILES (${relevantFiles.length})`
+              }
+              icon={FileCode}
+              defaultOpen={true}
+              accent={false}
+            >
+              {citationsCount > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: (hasFiles ? 14 : 0) }}>
+                  {citations.map((cit, idx) => (
+                    <div key={idx} style={{ background: "rgba(0,20,5,0.4)", border: "1px solid rgba(0,255,65,0.12)", padding: 10, borderRadius: 3 }}>
+                      <div style={{ fontSize: 11, color: "#00ff41", marginBottom: 5, fontFamily: "'JetBrains Mono', monospace", display: "flex", gap: 8, alignItems: "center" }}>
+                        <span style={{ fontWeight: 600 }}>{cit.file}</span>
+                        {(cit.start_line !== undefined && cit.end_line !== undefined) && (
+                          <span style={{ color: "#008822", fontSize: 10 }}>
+                            (Lines {cit.start_line}–{cit.end_line})
+                          </span>
+                        )}
+                      </div>
+                      {cit.snippet && (
+                        <pre style={{ fontSize: 10, color: "#00cc2e", margin: 0, whiteSpace: "pre-wrap", fontFamily: "'JetBrains Mono', monospace", background: "rgba(0,10,2,0.6)", padding: "6px 8px", borderRadius: 2 }}>{cit.snippet}</pre>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {hasFiles && (
+                <div>
+                  {citationsCount > 0 && (
+                    <div style={{ fontSize: 10, color: "#005015", letterSpacing: 1, marginBottom: 6 }}>
+                      RELEVANT REPOSITORY FILES:
+                    </div>
+                  )}
+                  <SourcesList files={relevantFiles} repoUrl={resolvedRepoUrl} />
+                </div>
+              )}
+            </Accordion>
+          )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── WORKFLOW SELECTOR BAR ───────────────────────────────────────────────────
+
+function WorkflowSelector({ activeWorkflow, onSelectWorkflow, generatePatch, onTogglePatch }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 8,
+        padding: "7px 12px",
+        background: "rgba(0,14,4,0.75)",
+        border: "1px solid rgba(0,255,65,0.14)",
+        borderRadius: 4,
+        marginBottom: 8,
+        flexWrap: "wrap",
+      }}
+    >
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <button
+          type="button"
+          onClick={() => onSelectWorkflow("issue")}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 12px",
+            background: activeWorkflow === "issue" ? "rgba(0,180,50,0.2)" : "transparent",
+            border: `1px solid ${activeWorkflow === "issue" ? "#00ff41" : "rgba(0,255,65,0.15)"}`,
+            borderRadius: 3,
+            color: activeWorkflow === "issue" ? "#00ff41" : "#00701a",
+            cursor: "pointer",
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 11,
+            fontWeight: activeWorkflow === "issue" ? 700 : 500,
+            letterSpacing: 0.5,
+            transition: "all 0.15s ease",
+            boxShadow: activeWorkflow === "issue" ? "0 0 10px rgba(0,255,65,0.15)" : "none",
+          }}
+        >
+          <Zap size={12} color={activeWorkflow === "issue" ? "#00ff41" : "#00701a"} />
+          <span>ASK ABOUT AN ISSUE</span>
+          {activeWorkflow === "issue" && (
+            <span style={{ fontSize: 8, opacity: 0.9 }}>●</span>
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onSelectWorkflow("repo")}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 12px",
+            background: activeWorkflow === "repo" ? "rgba(0,180,50,0.2)" : "transparent",
+            border: `1px solid ${activeWorkflow === "repo" ? "#00ff41" : "rgba(0,255,65,0.15)"}`,
+            borderRadius: 3,
+            color: activeWorkflow === "repo" ? "#00ff41" : "#00701a",
+            cursor: "pointer",
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 11,
+            fontWeight: activeWorkflow === "repo" ? 700 : 500,
+            letterSpacing: 0.5,
+            transition: "all 0.15s ease",
+            boxShadow: activeWorkflow === "repo" ? "0 0 10px rgba(0,255,65,0.15)" : "none",
+          }}
+        >
+          <FolderTree size={12} color={activeWorkflow === "repo" ? "#00ff41" : "#00701a"} />
+          <span>ANALYZE REPOSITORY</span>
+          {activeWorkflow === "repo" && (
+            <span style={{ fontSize: 8, opacity: 0.9 }}>●</span>
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onSelectWorkflow("ranked_issues")}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 12px",
+            background: activeWorkflow === "ranked_issues" ? "rgba(0,180,50,0.2)" : "transparent",
+            border: `1px solid ${activeWorkflow === "ranked_issues" ? "#00ff41" : "rgba(0,255,65,0.15)"}`,
+            borderRadius: 3,
+            color: activeWorkflow === "ranked_issues" ? "#00ff41" : "#00701a",
+            cursor: "pointer",
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 11,
+            fontWeight: activeWorkflow === "ranked_issues" ? 700 : 500,
+            letterSpacing: 0.5,
+            transition: "all 0.15s ease",
+            boxShadow: activeWorkflow === "ranked_issues" ? "0 0 10px rgba(0,255,65,0.15)" : "none",
+          }}
+        >
+          <ListOrdered size={12} color={activeWorkflow === "ranked_issues" ? "#00ff41" : "#00701a"} />
+          <span>RANKED ISSUES</span>
+          {activeWorkflow === "ranked_issues" && (
+            <span style={{ fontSize: 8, opacity: 0.9 }}>●</span>
+          )}
+        </button>
+      </div>
+
+      {activeWorkflow === "issue" && (
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            cursor: "pointer",
+            fontSize: 10,
+            color: generatePatch ? "#00ff41" : "#00701a",
+            fontFamily: "'JetBrains Mono', monospace",
+            userSelect: "none",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={generatePatch}
+            onChange={(e) => onTogglePatch(e.target.checked)}
+            style={{
+              accentColor: "#00ff41",
+              cursor: "pointer",
+              width: 12,
+              height: 12,
+            }}
+          />
+          <span>Generate unified patch diff (opt-in)</span>
+        </label>
+      )}
+    </div>
+  );
+}
+
+// ─── WELCOME PANEL COMPONENT ─────────────────────────────────────────────────
+
+function WelcomePanel({ repoName, activeWorkflow, onSelectWorkflow }) {
+  return (
+    <div
+      style={{
+        border: "1px solid rgba(0,255,65,0.2)",
+        borderRadius: 4,
+        background: "rgba(0,12,3,0.7)",
+        padding: "18px 20px",
+        marginBottom: 8,
+        boxShadow: "inset 0 0 40px rgba(0,0,0,0.5)",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Brain size={16} color="#00ff41" />
+          <span style={{ fontSize: 13, color: "#00ff41", fontWeight: 700, letterSpacing: 1, fontFamily: "'JetBrains Mono', monospace" }}>
+            CONTRIB REPOSITORY INTELLIGENCE
+          </span>
+        </div>
+        <Badge label={`INDEXED: ${repoName}`} color="green" />
+      </div>
+
+      <p style={{ fontSize: 12, color: "#00cc2e", lineHeight: 1.6, marginBottom: 16 }}>
+        Welcome to Contrib. Choose a workflow below to investigate individual issues, conduct a holistic codebase audit, or explore ranked approachable repository issues.
+      </p>
+
+      {/* Selectable Workflow Cards */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12, marginBottom: 14 }}>
+        {/* Card A */}
+        <div
+          onClick={() => onSelectWorkflow("issue")}
+          style={{
+            border: `1px solid ${activeWorkflow === "issue" ? "#00ff41" : "rgba(0,255,65,0.15)"}`,
+            borderRadius: 4,
+            padding: "14px 16px",
+            background: activeWorkflow === "issue" ? "rgba(0,180,50,0.12)" : "rgba(0,10,2,0.5)",
+            cursor: "pointer",
+            transition: "all 0.2s ease",
+            boxShadow: activeWorkflow === "issue" ? "0 0 15px rgba(0,255,65,0.12)" : "none",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <Zap size={14} color={activeWorkflow === "issue" ? "#00ff41" : "#00701a"} />
+              <span style={{ fontSize: 11, fontWeight: 700, color: activeWorkflow === "issue" ? "#00ff41" : "#00cc2e", letterSpacing: 1 }}>
+                ASK ABOUT AN ISSUE
+              </span>
+            </div>
+            {activeWorkflow === "issue" ? <Badge label="ACTIVE" color="green" /> : <span style={{ fontSize: 10, color: "#005015" }}>[SELECT]</span>}
+          </div>
+          <p style={{ fontSize: 11, color: "#00aa28", lineHeight: 1.5, margin: 0 }}>
+            Investigate a specific bug, error traceback, or GitHub issue URL. Analyzes root causes, affected files, and optionally crafts a fix patch.
+          </p>
+        </div>
+
+        {/* Card B */}
+        <div
+          onClick={() => onSelectWorkflow("repo")}
+          style={{
+            border: `1px solid ${activeWorkflow === "repo" ? "#00ff41" : "rgba(0,255,65,0.15)"}`,
+            borderRadius: 4,
+            padding: "14px 16px",
+            background: activeWorkflow === "repo" ? "rgba(0,180,50,0.12)" : "rgba(0,10,2,0.5)",
+            cursor: "pointer",
+            transition: "all 0.2s ease",
+            boxShadow: activeWorkflow === "repo" ? "0 0 15px rgba(0,255,65,0.12)" : "none",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <FolderTree size={14} color={activeWorkflow === "repo" ? "#00ff41" : "#00701a"} />
+              <span style={{ fontSize: 11, fontWeight: 700, color: activeWorkflow === "repo" ? "#00ff41" : "#00cc2e", letterSpacing: 1 }}>
+                ANALYZE REPOSITORY
+              </span>
+            </div>
+            {activeWorkflow === "repo" ? <Badge label="ACTIVE" color="green" /> : <span style={{ fontSize: 10, color: "#005015" }}>[SELECT]</span>}
+          </div>
+          <p style={{ fontSize: 11, color: "#00aa28", lineHeight: 1.5, margin: 0 }}>
+            Review architecture, code quality, dependency health, and reliability risks across the repository with structured audit reports.
+          </p>
+        </div>
+
+        {/* Card C */}
+        <div
+          onClick={() => onSelectWorkflow("ranked_issues")}
+          style={{
+            border: `1px solid ${activeWorkflow === "ranked_issues" ? "#00ff41" : "rgba(0,255,65,0.15)"}`,
+            borderRadius: 4,
+            padding: "14px 16px",
+            background: activeWorkflow === "ranked_issues" ? "rgba(0,180,50,0.12)" : "rgba(0,10,2,0.5)",
+            cursor: "pointer",
+            transition: "all 0.2s ease",
+            boxShadow: activeWorkflow === "ranked_issues" ? "0 0 15px rgba(0,255,65,0.12)" : "none",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <ListOrdered size={14} color={activeWorkflow === "ranked_issues" ? "#00ff41" : "#00701a"} />
+              <span style={{ fontSize: 11, fontWeight: 700, color: activeWorkflow === "ranked_issues" ? "#00ff41" : "#00cc2e", letterSpacing: 1 }}>
+                RANKED ISSUES
+              </span>
+            </div>
+            {activeWorkflow === "ranked_issues" ? <Badge label="ACTIVE" color="green" /> : <span style={{ fontSize: 10, color: "#005015" }}>[SELECT]</span>}
+          </div>
+          <p style={{ fontSize: 11, color: "#00aa28", lineHeight: 1.5, margin: 0 }}>
+            Browse open GitHub issues ranked by difficulty, beginner approachability, and claimed status with deeper AI analysis.
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
@@ -506,56 +893,217 @@ function QAAnswerCard({ data, repoUrl, repoName }) {
 // ─── MAIN CHATBOX COMPONENT ──────────────────────────────────────────────────
 
 export default function ChatBox({ repoUrl, repoName, onReset }) {
+  const cleanRepoName = sanitizeRepoName(repoName, repoUrl);
+  const [activeWorkflow, setActiveWorkflow] = useState("issue"); // "issue" | "repo" | "ranked_issues"
+  const [generatePatch, setGeneratePatch] = useState(false);
   const [messages, setMessages] = useState([
     {
       role: "assistant",
-      type: "text",
-      content: `Repository [${repoName}] indexed successfully.\n\nPaste a GitHub issue URL for deep analysis, or ask anything about the codebase.`,
+      type: "welcome_init",
+      content: `Repository [${cleanRepoName}] indexed successfully. Select a workflow below to begin analysis.`,
     },
   ]);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  const currentRequestIdRef = useRef(0);
   const bottomRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  // Ranked issues workflow state
+  const [rankedIssuesData, setRankedIssuesData] = useState(null);
+  const [rankedIssuesLoadingPhase, setRankedIssuesLoadingPhase] = useState(null); // null | 'loading_repo' | 'ranking_issues'
+  const [rankedIssuesError, setRankedIssuesError] = useState(null);
+  const [issuesLimit, setIssuesLimit] = useState(50);
+  const [deepTopN, setDeepTopN] = useState(5);
+
+  // Reset ranked issues if repoUrl changes to prevent displaying stale results
+  const [prevRepoUrl, setPrevRepoUrl] = useState(repoUrl);
+  if (prevRepoUrl !== repoUrl) {
+    setPrevRepoUrl(repoUrl);
+    setRankedIssuesData(null);
+    setRankedIssuesError(null);
+    setRankedIssuesLoadingPhase(null);
+  }
+
+  // Two-step fetch sequence: Step A (load repo) -> Step B (retrieve ranked issues)
+  const handleFetchRankedIssues = useCallback(async (optLimit = issuesLimit, optDeepTopN = deepTopN) => {
+    if (rankedIssuesLoadingPhase) return;
+    setRankedIssuesError(null);
+    setRankedIssuesLoadingPhase('loading_repo');
+
+    try {
+      // Step A: Load and index repository
+      await ensureRepoLoaded(repoUrl, () => {});
+
+      // Step B: Retrieve ranked issues from POST /api/repo-issues
+      setRankedIssuesLoadingPhase('ranking_issues');
+      const data = await fetchRankedIssues(repoUrl, {
+        limit: optLimit,
+        deepTopN: optDeepTopN,
+      });
+
+      setRankedIssuesData(data);
+    } catch (err) {
+      setRankedIssuesError(err.message || 'Failed to retrieve repository issues.');
+    } finally {
+      setRankedIssuesLoadingPhase(null);
+    }
+  }, [deepTopN, issuesLimit, rankedIssuesLoadingPhase, repoUrl]);
+
+  // Auto-fetch on switching to ranked_issues if not already loaded
+  useEffect(() => {
+    if (activeWorkflow === 'ranked_issues' && !rankedIssuesData && !rankedIssuesLoadingPhase && !rankedIssuesError && repoUrl) {
+      const timer = setTimeout(() => {
+        handleFetchRankedIssues(issuesLimit, deepTopN);
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+  }, [activeWorkflow, deepTopN, handleFetchRankedIssues, issuesLimit, rankedIssuesData, rankedIssuesError, rankedIssuesLoadingPhase, repoUrl]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isTyping]);
+  }, [messages, isTyping, rankedIssuesData, rankedIssuesLoadingPhase]);
+
+  const prompts = activeWorkflow === "issue"
+    ? [
+        "Why does the webcam stream fail to initialize?",
+        "Explain this Python traceback and root cause.",
+        "Investigate this GitHub issue",
+      ]
+    : activeWorkflow === "repo"
+    ? [
+        "What are the biggest issues in this repository?",
+        "Review the architecture and identify reliability risks.",
+        "What should we fix first to improve maintainability?",
+      ]
+    : [
+        "Refresh ranked issues",
+        "Fetch top 25 approachable issues",
+        "Fetch top 100 open issues",
+      ];
+
+  const composerPlaceholder = activeWorkflow === "issue"
+    ? "Describe a bug, paste an error, or enter a GitHub issue URL..."
+    : activeWorkflow === "repo"
+    ? "Ask for an architecture review, code-quality audit, or prioritized findings..."
+    : "Enter a limit or click to refresh and rank repository issues...";
+
+  const handleSelectPrompt = (promptText) => {
+    if (activeWorkflow === "ranked_issues") {
+      if (promptText.includes("25")) {
+        setIssuesLimit(25);
+        handleFetchRankedIssues(25, deepTopN);
+      } else if (promptText.includes("100")) {
+        setIssuesLimit(100);
+        handleFetchRankedIssues(100, deepTopN);
+      } else {
+        handleFetchRankedIssues(issuesLimit, deepTopN);
+      }
+      return;
+    }
+    setInput(promptText);
+    if (textareaRef.current) {
+      textareaRef.current.focus();
+    }
+  };
 
   const handleSendMessage = async (e) => {
-    e.preventDefault();
+    if (e && e.preventDefault) e.preventDefault();
+
+    if (activeWorkflow === "ranked_issues") {
+      const trimmed = input.trim();
+      setInput("");
+      const num = parseInt(trimmed.replace(/\D/g, ''), 10);
+      const newLimit = (num && num >= 1 && num <= 100) ? num : issuesLimit;
+      if (num && num !== issuesLimit) {
+        setIssuesLimit(newLimit);
+      }
+      await handleFetchRankedIssues(newLimit, deepTopN);
+      return;
+    }
+
     if (!input.trim() || isTyping) return;
 
     const userMsg = input.trim();
-    setMessages(prev => [...prev, { role: "user", type: "text", content: userMsg }]);
-    setInput("");
+    const requestId = ++currentRequestIdRef.current;
     setIsTyping(true);
+    setInput("");
 
-    const isIssue = userMsg.includes("github.com") && userMsg.includes("/issues/");
-    const endpoint = isIssue ? "/api/analyze-issue?generate_patch=true" : "/api/ask";
-    const payload = isIssue
-      ? { repo_url: repoUrl, issue_url: userMsg }
-      : { repo_url: repoUrl, question: userMsg };
+    setMessages(prev => [
+      ...prev,
+      {
+        role: "user",
+        type: "text",
+        content: userMsg,
+        workflow: activeWorkflow,
+        patchRequested: activeWorkflow === "issue" && generatePatch,
+      }
+    ]);
+
+    const baseUrl = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
 
     try {
-      const res = await fetch(`${import.meta.env.VITE_API_URL}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
+      if (activeWorkflow === "issue") {
+        const isUrl = userMsg.includes("github.com") && userMsg.includes("/issues/");
+        const payload = isUrl
+          ? { repo_url: repoUrl, issue_url: userMsg }
+          : { repo_url: repoUrl, issue_text: userMsg, issue_title: userMsg.slice(0, 80) };
 
-      if (isIssue) {
+        const res = await fetch(`${baseUrl}/api/analyze-issue?generate_patch=${generatePatch}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "ngrok-skip-browser-warning": "true",
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.detail || `Server error (${res.status})`);
+        }
+
+        const data = await res.json();
+        // Discard response if a newer request has already been issued
+        if (requestId !== currentRequestIdRef.current) return;
         setMessages(prev => [...prev, { role: "assistant", type: "issue_analysis", data }]);
+
       } else {
+        // activeWorkflow === "repo"
+        // Codebase analysis & questions call POST /api/ask
+        const res = await fetch(`${baseUrl}/api/ask`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "ngrok-skip-browser-warning": "true",
+          },
+          body: JSON.stringify({ repo_url: repoUrl, question: userMsg }),
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.detail || `Server error (${res.status})`);
+        }
+
+        const data = await res.json();
+        // Discard response if a newer request has already been issued
+        if (requestId !== currentRequestIdRef.current) return;
         setMessages(prev => [...prev, { role: "assistant", type: "qa_answer", data }]);
       }
-    } catch {
-      setMessages(prev => [...prev, {
-        role: "assistant", type: "text",
-        content: "[ERROR] Failed to reach backend. Check your connection.",
-      }]);
+    } catch (err) {
+      if (requestId !== currentRequestIdRef.current) return;
+      setMessages(prev => [
+        ...prev,
+        {
+          role: "assistant",
+          type: "text",
+          content: `[ERROR] ${err.message || "Failed to reach backend. Check your connection."}`,
+        }
+      ]);
     } finally {
-      setIsTyping(false);
+      if (requestId === currentRequestIdRef.current) {
+        setIsTyping(false);
+      }
     }
   };
 
@@ -588,9 +1136,9 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
             padding: "5px 10px", display: "flex", alignItems: "center", gap: 6,
             background: "rgba(0,180,50,0.06)",
           }}>
-            <GitBranch size={15} color="#00ff41" /> {/* Added Logo Here */}
+            <GitBranch size={15} color="#00ff41" />
             <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: 1, color: "#00cc2e" }}>
-              {repoName.toUpperCase()}
+              {cleanRepoName.toUpperCase()}
             </span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -628,6 +1176,37 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
           overflowX: "hidden",
         }}
       >
+        {/* Welcome screen visible at top */}
+        <WelcomePanel
+          repoName={cleanRepoName}
+          activeWorkflow={activeWorkflow}
+          onSelectWorkflow={setActiveWorkflow}
+          onSelectPrompt={handleSelectPrompt}
+        />
+
+        {activeWorkflow === "ranked_issues" && (
+          <div style={{ width: "100%", marginBottom: 12 }}>
+            <RankedIssuesView
+              data={rankedIssuesData}
+              loadingPhase={rankedIssuesLoadingPhase}
+              error={rankedIssuesError}
+              onRefresh={() => handleFetchRankedIssues(issuesLimit, deepTopN)}
+              limit={issuesLimit}
+              onLimitChange={(newLimit) => {
+                setIssuesLimit(newLimit);
+                handleFetchRankedIssues(newLimit, deepTopN);
+              }}
+              deepTopN={deepTopN}
+              onDeepTopNChange={(newTopN) => {
+                setDeepTopN(newTopN);
+                handleFetchRankedIssues(issuesLimit, newTopN);
+              }}
+              repoName={cleanRepoName}
+              repoUrl={repoUrl}
+            />
+          </div>
+        )}
+
         {messages.map((msg, idx) => (
           <motion.div
             key={idx}
@@ -640,11 +1219,11 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
             }}
           >
             {msg.role === "assistant" && (
-              <div style={{ display: "flex", flexDirection: "column", width: msg.type === "text" ? "auto" : "100%", maxWidth: msg.type === "text" ? "80%" : "100%", gap: 4 }}>
+              <div style={{ display: "flex", flexDirection: "column", width: (msg.type === "text" || msg.type === "welcome_init") ? "auto" : "100%", maxWidth: (msg.type === "text" || msg.type === "welcome_init") ? "80%" : "100%", gap: 4 }}>
                 <span style={{ fontSize: 10, color: "#005015", letterSpacing: 2, paddingLeft: 2 }}>
                   MENTOR@CONTRIB $
                 </span>
-                {msg.type === "text" && (
+                {(msg.type === "text" || msg.type === "welcome_init") && (
                   <div style={{
                     background: "rgba(0,10,2,0.6)",
                     border: "1px solid rgba(0,200,50,0.12)",
@@ -670,7 +1249,7 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
                   <QAAnswerCard
                     data={msg.data}
                     repoUrl={repoUrl}
-                    repoName={repoName}
+                    repoName={cleanRepoName}
                   />
                 )}
               </div>
@@ -678,9 +1257,13 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
 
             {msg.role === "user" && (
               <div style={{ display: "flex", flexDirection: "column", maxWidth: "68%", gap: 4, alignItems: "flex-end" }}>
-                <span style={{ fontSize: 10, color: "#004010", letterSpacing: 2, paddingRight: 2 }}>
-                  YOU $
-                </span>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  {msg.patchRequested && <Badge label="PATCH REQUESTED" color="yellow" />}
+                  <Badge label={msg.workflow === "issue" ? "ISSUE MODE" : "REPO MODE"} color="muted" />
+                  <span style={{ fontSize: 10, color: "#004010", letterSpacing: 2 }}>
+                    YOU $
+                  </span>
+                </div>
                 <div style={{
                   background: "transparent",
                   border: "1px solid rgba(0,160,45,0.35)",
@@ -719,7 +1302,7 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
                 />
               ))}
               <span style={{ fontSize: 11, color: "#026e1f", marginLeft: 8, letterSpacing: 1 }}>
-                processing...
+                processing request...
               </span>
             </div>
           </motion.div>
@@ -727,13 +1310,58 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
         <div ref={bottomRef} />
       </div>
 
-      {/* Input */}
+      {/* Composer Area */}
       <div style={{
         padding: "14px 28px 18px",
         borderTop: "1px solid rgba(0,255,65,0.1)",
         background: "rgba(0,8,2,0.95)",
         flexShrink: 0,
       }}>
+        {/* Workflow Selector Bar */}
+        <WorkflowSelector
+          activeWorkflow={activeWorkflow}
+          onSelectWorkflow={setActiveWorkflow}
+          generatePatch={generatePatch}
+          onTogglePatch={setGeneratePatch}
+        />
+
+        {/* Suggestion Chips */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontSize: 10, color: "#005015", letterSpacing: 1 }}>SUGGESTIONS:</span>
+          {prompts.map((p, idx) => (
+            <button
+              key={idx}
+              type="button"
+              onClick={() => handleSelectPrompt(p)}
+              disabled={isTyping}
+              style={{
+                background: "rgba(0,255,65,0.03)",
+                border: "1px solid rgba(0,255,65,0.12)",
+                borderRadius: 2,
+                color: "#00aa28",
+                fontSize: 11,
+                padding: "3px 8px",
+                cursor: isTyping ? "not-allowed" : "pointer",
+                fontFamily: "'JetBrains Mono', monospace",
+                transition: "all 0.15s ease",
+                textAlign: "left",
+              }}
+              onMouseEnter={e => {
+                if (!isTyping) {
+                  e.currentTarget.style.borderColor = "rgba(0,255,65,0.4)";
+                  e.currentTarget.style.color = "#00ff41";
+                }
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.borderColor = "rgba(0,255,65,0.12)";
+                e.currentTarget.style.color = "#00aa28";
+              }}
+            >
+              {p}
+            </button>
+          ))}
+        </div>
+
         <form onSubmit={handleSendMessage}>
           <div style={{
             display: "flex", alignItems: "flex-end",
@@ -754,8 +1382,10 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
           >
             <span style={{ color: "#005a15", fontSize: 13, paddingBottom: 1, flexShrink: 0 }}>▶</span>
             <textarea
+              ref={textareaRef}
               rows={1}
               value={input}
+              disabled={isTyping}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -763,7 +1393,7 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
                   handleSendMessage(e);
                 }
               }}
-              placeholder="paste an issue URL or ask about the codebase..."
+              placeholder={composerPlaceholder}
               className="terminal-input"
               style={{ fontSize: 13, lineHeight: 1.5, flex: 1 }}
             />
@@ -784,7 +1414,7 @@ export default function ChatBox({ repoUrl, repoName, onReset }) {
             </button>
           </div>
           <div style={{ marginTop: 7, fontSize: 10, color: "#004010", letterSpacing: 0.5, paddingLeft: 2 }}>
-            ENTER to send · SHIFT+ENTER for newline · paste github issue URL for deep analysis
+            ENTER to send · SHIFT+ENTER for newline · {activeWorkflow === "issue" ? "Describe a bug, paste an error, or enter a GitHub issue URL" : "Ask architecture & quality questions, or run a full repo audit"}
           </div>
         </form>
       </div>
