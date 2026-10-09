@@ -1,7 +1,67 @@
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, Component } from "react";
 import { motion, AnimatePresence } from 'framer-motion';
-import { GitBranch, ArrowRight, Loader2, Send, Terminal } from 'lucide-react';
+import { ArrowRight, Terminal, AlertTriangle } from 'lucide-react';
 import ChatBox from './Chatbox';
+
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error("Contrib ErrorBoundary caught an error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{
+          padding: 24,
+          background: '#050f05',
+          border: '1px solid #f87171',
+          color: '#f87171',
+          fontFamily: "'JetBrains Mono', monospace",
+          margin: 20,
+          borderRadius: 4,
+          maxWidth: 600,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, marginBottom: 8, fontSize: 13 }}>
+            <AlertTriangle size={16} color="#f87171" />
+            <span>[RUNTIME ERROR DETECTED]</span>
+          </div>
+          <div style={{ fontSize: 11, color: '#fca5a5', marginBottom: 16, lineHeight: 1.5 }}>
+            {this.state.error?.message || 'An unexpected rendering error occurred.'}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              this.setState({ hasError: false, error: null });
+              if (this.props.onReset) this.props.onReset();
+            }}
+            style={{
+              background: 'rgba(200, 60, 60, 0.2)',
+              border: '1px solid #f87171',
+              color: '#f87171',
+              padding: '6px 14px',
+              fontFamily: "'JetBrains Mono', monospace",
+              fontSize: 11,
+              cursor: 'pointer',
+              borderRadius: 2,
+            }}
+          >
+            [RECOVER / RETURN TO LANDING]
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Import JetBrains Mono from Google Fonts via a style tag
 const fontLink = document.createElement('link');
@@ -286,9 +346,13 @@ export default function App() {
     setLoadingStatus('connecting...'); 
 
     try {
-      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/load-repo`, {
+      const baseUrl = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+      const res = await fetch(`${baseUrl}/api/load-repo`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true',
+        },
         body: JSON.stringify({ repo_url: repoUrl }),
       });
 
@@ -302,8 +366,12 @@ export default function App() {
       if (contentType.includes('application/json')) {
         const data = await res.json();
         setLoadingStatus(data.status);
-        if (data.status === 'cached' || data.status === 'done' || data.status === 'loaded') {
-          setRepoName(data.repo_name || data.result?.repo_name);
+        if (data.status === 'cached' || data.status === 'done' || data.status === 'loaded' || data.status === 'ready') {
+          const raw = data.repo_name || data.result?.repo_name || '';
+          const clean = (!raw || raw.includes('tmp') || raw.includes('cloned_repo') || raw.includes('var/folders'))
+            ? (repoUrl.replace(/\/+$/, '').replace(/\.git$/, '').split('/').pop() || 'Repository')
+            : raw;
+          setRepoName(clean);
           setTimeout(() => setAppState('chat'), 600);
         } else {
           alert('Failed to load repo: ' + (data.detail || 'Unknown error'));
@@ -335,8 +403,12 @@ export default function App() {
             const data = JSON.parse(line);
             setLoadingStatus(data.status); 
 
-            if (data.status === 'cached' || data.status === 'done' || data.status === 'loaded') {
-              setRepoName(data.repo_name || data.result?.repo_name);
+            if (data.status === 'cached' || data.status === 'done' || data.status === 'loaded' || data.status === 'ready') {
+              const raw = data.repo_name || data.result?.repo_name || '';
+              const clean = (!raw || raw.includes('tmp') || raw.includes('cloned_repo') || raw.includes('var/folders'))
+                ? (repoUrl.replace(/\/+$/, '').replace(/\.git$/, '').split('/').pop() || 'Repository')
+                : raw;
+              setRepoName(clean);
               setTimeout(() => setAppState('chat'), 600);
               return; 
             } else if (data.status === 'error') {
@@ -566,17 +638,26 @@ export default function App() {
 
           {/* VIEW 3: CHAT */}
           {appState === 'chat' && (
-            <ChatBox
-              key="chat"
-              repoUrl={repoUrl}
-              repoName={repoName}
-              onReset={() => { 
+            <ErrorBoundary
+              onReset={() => {
                 setAppState('landing');
                 setRepoUrl('');
                 setRepoName('');
                 setLoadingStatus('');
               }}
-            />
+            >
+              <ChatBox
+                key="chat"
+                repoUrl={repoUrl}
+                repoName={repoName}
+                onReset={() => { 
+                  setAppState('landing');
+                  setRepoUrl('');
+                  setRepoName('');
+                  setLoadingStatus('');
+                }}
+              />
+            </ErrorBoundary>
           )}
         </AnimatePresence>
       </div>
